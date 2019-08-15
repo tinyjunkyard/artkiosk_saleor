@@ -3,17 +3,20 @@ from typing import Iterable
 from uuid import uuid4
 
 from django.conf import settings
-from django.contrib.postgres.fields import HStoreField, JSONField
+from django.contrib.postgres.fields import JSONField
+from django.core import exceptions
 from django.core.validators import MinValueValidator
 from django.db import models
-from django.db.models import F
+from django.db.models import F, Q
 from django.urls import reverse
 from django.utils.encoding import smart_text
+from django.utils.html import strip_tags
 from django.utils.text import slugify
 from django.utils.translation import pgettext_lazy
 from django_measurement.models import MeasurementField
 from django_prices.models import MoneyField
 from django_prices.templatetags import prices_i18n
+from draftjs_sanitizer import clean_draft_js
 from measurement.measures import Weight
 from mptt.managers import TreeManager
 from mptt.models import MPTTModel
@@ -22,17 +25,46 @@ from text_unidecode import unidecode
 from versatileimagefield.fields import PPOIField, VersatileImageField
 
 from ..core.exceptions import InsufficientStock
-from ..core.models import PublishableModel, PublishedQuerySet, SortableModel
+from ..core.fields import FilterableJSONBField, SanitizedJSONField
+from ..core.models import (
+    ModelWithMetadata,
+    PublishableModel,
+    PublishedQuerySet,
+    SortableModel,
+)
 from ..core.utils import build_absolute_uri
-from ..core.utils.json_serializer import CustomJsonEncoder
+from ..core.utils.draftjs import json_content_to_raw_text
 from ..core.utils.translations import TranslationProxy
 from ..core.weight import WeightUnits, zero_weight
 from ..discount import DiscountInfo
 from ..discount.utils import calculate_discounted_price
 from ..seo.models import SeoModel, SeoModelTranslation
+from . import AttributeInputType
 
 
-class Category(MPTTModel, SeoModel):
+def validate_attribute_json(value):
+    for k, values in value.items():
+        if not isinstance(k, str):
+            raise exceptions.ValidationError(
+                f"The key {k!r} should be of type str (got {type(k)})",
+                params={"k": k, "values": values},
+            )
+        if not isinstance(values, list):
+            raise exceptions.ValidationError(
+                f"The values of {k!r} should be of type list (got {type(values)})",
+                params={"k": k, "values": values},
+            )
+
+        for value_pk in values:
+            if not isinstance(value_pk, str):
+                raise exceptions.ValidationError(
+                    f"The values inside {value_pk!r} should be of type str "
+                    f"(got {type(value_pk)})",
+                    params={"k": k, "values": values, "value_pk": value_pk},
+                )
+
+
+class Category(MPTTModel, ModelWithMetadata, SeoModel):
     name = models.CharField(max_length=128)
     slug = models.SlugField(max_length=128)
     description = models.TextField(blank=True)
@@ -83,7 +115,7 @@ class CategoryTranslation(SeoModelTranslation):
         )
 
 
-class ProductType(models.Model):
+class ProductType(ModelWithMetadata):
     name = models.CharField(max_length=128)
     has_variants = models.BooleanField(default=True)
     is_shipping_required = models.BooleanField(default=True)
@@ -91,7 +123,6 @@ class ProductType(models.Model):
     weight = MeasurementField(
         measurement=Weight, unit_choices=WeightUnits.CHOICES, default=zero_weight
     )
-    meta = JSONField(blank=True, null=True, default=dict, encoder=CustomJsonEncoder)
 
     class Meta:
         app_label = "product"
@@ -114,17 +145,22 @@ class ProductsQueryset(PublishedQuerySet):
         qs = self.visible_to_user(user).prefetch_related(
             "collections__products__collectionproduct"
         )
-        qs = qs.order_by(F("collectionproduct__sort_order").asc(nulls_last=True))
+        qs = qs.order_by(
+            F("collectionproduct__sort_order").asc(nulls_last=True),
+            F("collectionproduct__id"),
+        )
         return qs
 
 
-class Product(SeoModel, PublishableModel):
+class Product(SeoModel, ModelWithMetadata, PublishableModel):
     product_type = models.ForeignKey(
         ProductType, related_name="products", on_delete=models.CASCADE
     )
     name = models.CharField(max_length=128)
     description = models.TextField(blank=True)
-    description_json = JSONField(blank=True, default=dict)
+    description_json = SanitizedJSONField(
+        blank=True, default=dict, sanitizer=clean_draft_js
+    )
     category = models.ForeignKey(
         Category, related_name="products", on_delete=models.CASCADE
     )
@@ -133,14 +169,14 @@ class Product(SeoModel, PublishableModel):
         max_digits=settings.DEFAULT_MAX_DIGITS,
         decimal_places=settings.DEFAULT_DECIMAL_PLACES,
     )
-    attributes = HStoreField(default=dict, blank=True)
+    attributes = FilterableJSONBField(
+        default=dict, blank=True, validators=[validate_attribute_json]
+    )
     updated_at = models.DateTimeField(auto_now=True, null=True)
     charge_taxes = models.BooleanField(default=True)
     weight = MeasurementField(
         measurement=Weight, unit_choices=WeightUnits.CHOICES, blank=True, null=True
     )
-    meta = JSONField(blank=True, null=True, default=dict, encoder=CustomJsonEncoder)
-
     objects = ProductsQueryset.as_manager()
     translated = TranslationProxy()
 
@@ -170,6 +206,12 @@ class Product(SeoModel, PublishableModel):
 
     def __str__(self):
         return self.name
+
+    @property
+    def plain_text_description(self):
+        if settings.USE_JSON_CONTENT:
+            return json_content_to_raw_text(self.description_json)
+        return strip_tags(self.description)
 
     @property
     def is_available(self):
@@ -205,7 +247,9 @@ class ProductTranslation(SeoModelTranslation):
     )
     name = models.CharField(max_length=128)
     description = models.TextField(blank=True)
-    description_json = JSONField(blank=True, default=dict)
+    description_json = SanitizedJSONField(
+        blank=True, default=dict, sanitizer=clean_draft_js
+    )
 
     class Meta:
         unique_together = (("language_code", "product"),)
@@ -223,7 +267,7 @@ class ProductTranslation(SeoModelTranslation):
         )
 
 
-class ProductVariant(models.Model):
+class ProductVariant(ModelWithMetadata):
     sku = models.CharField(max_length=32, unique=True)
     name = models.CharField(max_length=255, blank=True)
     price_override = MoneyField(
@@ -236,7 +280,9 @@ class ProductVariant(models.Model):
     product = models.ForeignKey(
         Product, related_name="variants", on_delete=models.CASCADE
     )
-    attributes = HStoreField(default=dict, blank=True)
+    attributes = FilterableJSONBField(
+        default=dict, blank=True, validators=[validate_attribute_json]
+    )
     images = models.ManyToManyField("ProductImage", through="VariantImage")
     track_inventory = models.BooleanField(default=True)
     quantity = models.IntegerField(
@@ -276,8 +322,9 @@ class ProductVariant(models.Model):
         return self.product.is_available
 
     def check_quantity(self, quantity):
-        """Check if there is at least the given quantity in stock
-        if stock handling is enabled.
+        """Check if there is at least the given quantity in stock.
+
+        If stock handling is disabled, it simply run no check.
         """
         if self.track_inventory and quantity > self.quantity_available:
             raise InsufficientStock(self)
@@ -363,7 +410,7 @@ class ProductVariantTranslation(models.Model):
         return self.name or str(self.product_variant)
 
 
-class DigitalContent(models.Model):
+class DigitalContent(ModelWithMetadata):
     FILE = "file"
     TYPE_CHOICES = (
         (FILE, pgettext_lazy("File as a digital product", "digital_product")),
@@ -409,28 +456,120 @@ class DigitalContentUrl(models.Model):
         return build_absolute_uri(url)
 
 
-class Attribute(models.Model):
-    slug = models.SlugField(max_length=50)
-    name = models.CharField(max_length=50)
-    product_type = models.ForeignKey(
-        ProductType,
-        related_name="product_attributes",
-        blank=True,
-        null=True,
-        on_delete=models.CASCADE,
+class AttributeProduct(SortableModel):
+    attribute = models.ForeignKey(
+        "Attribute", related_name="attributeproduct", on_delete=models.CASCADE
     )
-    product_variant_type = models.ForeignKey(
-        ProductType,
-        related_name="variant_attributes",
-        blank=True,
-        null=True,
-        on_delete=models.CASCADE,
+    product_type = models.ForeignKey(
+        ProductType, related_name="attributeproduct", on_delete=models.CASCADE
     )
 
+    class Meta:
+        unique_together = (("attribute", "product_type"),)
+
+    def get_ordering_queryset(self):
+        return self.product_type.attributeproduct.all()
+
+
+class AttributeVariant(SortableModel):
+    attribute = models.ForeignKey(
+        "Attribute", related_name="attributevariant", on_delete=models.CASCADE
+    )
+    product_type = models.ForeignKey(
+        ProductType, related_name="attributevariant", on_delete=models.CASCADE
+    )
+
+    class Meta:
+        unique_together = (("attribute", "product_type"),)
+
+    def get_ordering_queryset(self):
+        return self.product_type.attributevariant.all()
+
+
+class AttributeQuerySet(models.QuerySet):
+    def get_unassigned_attributes(self, product_type_pk: int):
+        return self.exclude(
+            Q(attributeproduct__product_type_id=product_type_pk)
+            | Q(attributevariant__product_type_id=product_type_pk)
+        )
+
+    def get_assigned_attributes(self, product_type_pk: int):
+        return self.filter(
+            Q(attributeproduct__product_type_id=product_type_pk)
+            | Q(attributevariant__product_type_id=product_type_pk)
+        )
+
+    @staticmethod
+    def user_has_access_to_all(user):
+        return user.is_active and user.has_perm("product.manage_products")
+
+    def get_public_attributes(self):
+        return self.filter(visible_in_storefront=True)
+
+    def get_visible_to_user(self, user):
+        if self.user_has_access_to_all(user):
+            return self.all()
+        return self.get_public_attributes()
+
+    def _get_sorted_m2m_field(self, m2m_field_name: str, asc: bool):
+        sort_order_field = F(f"{m2m_field_name}__sort_order")
+        id_field = F(f"{m2m_field_name}__id")
+        if asc:
+            sort_method = sort_order_field.asc(nulls_last=True)
+            id_sort = id_field
+        else:
+            sort_method = sort_order_field.desc(nulls_first=True)
+            id_sort = id_field.desc()
+
+        return self.order_by(sort_method, id_sort)
+
+    def product_attributes_sorted(self, asc=True):
+        return self._get_sorted_m2m_field("attributeproduct", asc)
+
+    def variant_attributes_sorted(self, asc=True):
+        return self._get_sorted_m2m_field("attributevariant", asc)
+
+
+class Attribute(ModelWithMetadata):
+    slug = models.SlugField(max_length=50, unique=True)
+    name = models.CharField(max_length=50)
+
+    input_type = models.CharField(
+        max_length=50,
+        choices=AttributeInputType.CHOICES,
+        default=AttributeInputType.DROPDOWN,
+    )
+
+    product_types = models.ManyToManyField(
+        ProductType,
+        blank=True,
+        related_name="product_attributes",
+        through=AttributeProduct,
+        through_fields=["attribute", "product_type"],
+    )
+    product_variant_types = models.ManyToManyField(
+        ProductType,
+        blank=True,
+        related_name="variant_attributes",
+        through=AttributeVariant,
+        through_fields=["attribute", "product_type"],
+    )
+
+    value_required = models.BooleanField(default=False, blank=True)
+    is_variant_only = models.BooleanField(default=False, blank=True)
+    visible_in_storefront = models.BooleanField(default=True, blank=True)
+
+    filterable_in_storefront = models.BooleanField(default=True, blank=True)
+    filterable_in_dashboard = models.BooleanField(default=True, blank=True)
+
+    storefront_search_position = models.IntegerField(default=0, blank=True)
+    available_in_grid = models.BooleanField(default=True, blank=True)
+
+    objects = AttributeQuerySet.as_manager()
     translated = TranslationProxy()
 
     class Meta:
-        ordering = ("slug",)
+        ordering = ("storefront_search_position", "slug")
 
     def __str__(self):
         return self.name
@@ -476,11 +615,15 @@ class AttributeValue(SortableModel):
     translated = TranslationProxy()
 
     class Meta:
-        ordering = ("sort_order",)
+        ordering = ("sort_order", "id")
         unique_together = ("name", "attribute")
 
     def __str__(self):
         return self.name
+
+    @property
+    def input_type(self):
+        return self.attribute.input_type
 
     def get_ordering_queryset(self):
         return self.attribute.values.all()
@@ -542,11 +685,14 @@ class CollectionProduct(SortableModel):
         Product, related_name="collectionproduct", on_delete=models.CASCADE
     )
 
+    class Meta:
+        unique_together = (("collection", "product"),)
+
     def get_ordering_queryset(self):
         return self.product.collectionproduct.all()
 
 
-class Collection(SeoModel, PublishableModel):
+class Collection(SeoModel, ModelWithMetadata, PublishableModel):
     name = models.CharField(max_length=128, unique=True)
     slug = models.SlugField(max_length=128)
     products = models.ManyToManyField(

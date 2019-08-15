@@ -12,10 +12,45 @@ All notable, unreleased changes to this project will be documented in this file.
 - Fix voucher limit value when checkbox unchecked - #4456 by @benekex2
 - New menu design - #4476 by @benekex2
 - Mutation for changing logged user first and last name - #4489 by @fowczarek
+- Add mutation for deleting account - #4494 by @fowczarek
 - New translations:
   - Greek
+- Extensions Manager - #4497 by @korycins
+- Migration of tax logic into a plugin architecture - #4497 by @korycins
+- Move core.extensions to separate module - #4559 by @korycins
 - Fix searches and pickers - #4487 by @dominik-zeglen
-
+- Fix dashboard menu styles - #4491 by @benekex2
+- Do not allow random ids to appear in snapshots - #4495 by @dominik-zeglen
+- Order is no longer created when the payment was unsuccessful in the API - #4500 by @NyanKiyoshi
+- Fix navigation rwd - #4511 by @benekex2
+- Create general abstraction for object metadata - #4447 by @salwator
+- Contrast improvements - #4508 by @benekex2
+- Allow selecting the number of rows displayed in dashboard's list views - #4414 by @benekex2
+- Fix generating random avatars when updating staff accounts - #4521 by @maarcingebala
+- Changed license for artwork to CC-BY 4.0
+- Input UI changes - #4542 by @benekex2
+- Fix rendering user avatar when it's null #4546 by @maarcingebala
+- Do not lose focus while typing in product description field - #4549 by @dominik-zeglen
+- Update JSON menu representation in mutations - #4524 by @maarcingebala
+- Display menu item form errors - #4551 by @dominik-zeglen
+- Add voucher settings - #4556 by @benekex2
+- Enforced pydocstyle for Python docstrings over the project - #4562 by @NyanKiyoshi
+- The checkout process of digital orders no longer require shipping information over the API - #4573 by @NyanKiyoshi
+- Add e2e test config - #4553 by @dominik-zeglen
+- Fix MUI warnings - #4588 by @dominik-zeglen
+- Disabled unneeded reports from uWSGI about broken pipe and write errors from disconnected clients. Preventing from spamming sentry users. - #4596 by @NyanKiyoshi
+- Upgraded to django 2.2.4 - #4603 by @NyanKiyoshi
+- Invalid IP address in HTTP requests now fallback to the requester's IP address. - #4597 by @NyanKiyoshi
+- Add queries and mutation for serving and saving the configuration of all plugins - #4576 by @korycins
+- Refactor account mutations - #4510 by @fowczarek
+- Users cannot add multiple times the same product into a collection anymore - #4518 by @NyanKiyoshi
+- Enterprise-grade attributes management - #4351 by @dominik-zeglen and @NyanKiyoshi
+- Refetch attribute list after closing modal - #4615 by @dominik-zeglen
+- Add ability to toggle visible columns in product list - #4608 by @dominik-zeglen
+- Serialize empty URL as string when creating menu items - #4616 by @maarcingebala
+- Fix bulk actions - #4618 by @dominik-zeglen
+- Remove dashboard 2.0 files - #4631 by @dominik-zeglen
+- Refactoring of password recovery system - #4617 by @fowczarek
 
 ## 2.8.0
 
@@ -48,6 +83,9 @@ All notable, unreleased changes to this project will be documented in this file.
 - Add `SPECIFIC_PRODUCT` type to `VoucherType` - #4344 by @fowczarek
 - New translations:
   - Icelandic
+- Refactored the backend side of `checkoutCreate` to improve performances and prevent side effects over the user's checkout if the checkout creation was to fail. - #4367 by @NyanKiyoshi
+- Refactored the logic of cleaning the checkout shipping method over the API, so users do not lose the shipping method when updating their checkout. If the shipping method becomes invalid, it will be replaced by the cheapest available. - #4367 by @NyanKiyoshi & @szewczykmira
+- Refactored process of getting available shipping methods to make it easier to understand and prevent human-made errors. - #4367 by @NyanKiyoshi
 
 ## 2.7.0
 

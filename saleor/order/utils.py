@@ -9,10 +9,10 @@ from prices import Money, TaxedMoney
 from ..account.utils import store_user_address
 from ..checkout import AddressType
 from ..core.taxes import zero_money
-from ..core.taxes.interface import calculate_order_line_unit, calculate_order_shipping
 from ..core.weight import zero_weight
 from ..dashboard.order.utils import get_voucher_discount_for_order
 from ..discount.models import NotApplicable
+from ..extensions.manager import get_extensions_manager
 from ..order import FulfillmentStatus, OrderStatus, emails
 from ..order.models import Fulfillment, FulfillmentLine, Order, OrderLine
 from ..payment import ChargeStatus
@@ -23,11 +23,12 @@ from ..product.utils import (
     increase_stock,
 )
 from ..product.utils.digital_products import get_default_digital_content_settings
+from ..shipping.models import ShippingMethod
 from . import events
 
 
 def order_line_needs_automatic_fulfillment(line: OrderLine) -> bool:
-    """Check if given line is digital and should be automatically fulfilled"""
+    """Check if given line is digital and should be automatically fulfilled."""
     digital_content_settings = get_default_digital_content_settings()
     default_automatic_fulfillment = digital_content_settings["automatic_fulfillment"]
     content = line.variant.digital_content
@@ -39,8 +40,7 @@ def order_line_needs_automatic_fulfillment(line: OrderLine) -> bool:
 
 
 def order_needs_automatic_fullfilment(order: Order) -> bool:
-    """Check if order has digital products which should be automatically
-    fulfilled"""
+    """Check if order has digital products which should be automatically fulfilled."""
     for line in order.lines.digital():
         if order_line_needs_automatic_fulfillment(line):
             return True
@@ -56,8 +56,10 @@ def fulfill_order_line(order_line, quantity):
 
 
 def automatically_fulfill_digital_lines(order: Order):
-    """Fulfill all digital lines which have enabled automatic fulfillment
-    setting and send confirmation email."""
+    """Fulfill all digital lines which have enabled automatic fulfillment setting.
+
+    Send confirmation email afterward.
+    """
     digital_lines = order.lines.filter(
         is_shipping_required=False, variant__digital_content__isnull=False
     )
@@ -153,6 +155,7 @@ def recalculate_order_weight(order):
 
 def update_order_prices(order, discounts):
     """Update prices in order with given discounts and proper taxes."""
+    manager = get_extensions_manager()
     for line in order:
         if line.variant:
             unit_price = line.variant.get_price(discounts)
@@ -160,7 +163,7 @@ def update_order_prices(order, discounts):
             line.unit_price_gross = unit_price
             line.save(update_fields=["unit_price_net", "unit_price_gross"])
 
-            price = calculate_order_line_unit(line)
+            price = manager.calculate_order_line_unit(line)
             if price != line.unit_price:
                 line.unit_price = price
                 if price.tax and price.net:
@@ -168,7 +171,7 @@ def update_order_prices(order, discounts):
                 line.save()
 
     if order.shipping_method:
-        order.shipping_price = calculate_order_shipping(order)
+        order.shipping_price = manager.calculate_order_shipping(order)
         order.save()
 
     recalculate_order(order)
@@ -293,8 +296,8 @@ def add_variant_to_order(
             unit_price_gross=unit_price,
             variant=variant,
         )
-
-        unit_price = calculate_order_line_unit(line)
+        manager = get_extensions_manager()
+        unit_price = manager.calculate_order_line_unit(line)
         line.unit_price_net = unit_price.net
         line.unit_price_gross = unit_price.gross
         line.tax_rate = unit_price.tax / unit_price.net
@@ -374,3 +377,9 @@ def sum_order_totals(qs):
     zero = Money(0, currency=settings.DEFAULT_CURRENCY)
     taxed_zero = TaxedMoney(zero, zero)
     return sum([order.total for order in qs], taxed_zero)
+
+
+def get_valid_shipping_methods_for_order(order: Order):
+    return ShippingMethod.objects.applicable_shipping_methods_for_instance(
+        order, price=order.get_subtotal().gross
+    )
