@@ -1,6 +1,7 @@
 import uuid
 from decimal import Decimal
 from io import BytesIO
+from typing import List
 from unittest.mock import MagicMock, Mock
 
 import pytest
@@ -20,11 +21,11 @@ from saleor.account.models import Address, User
 from saleor.checkout import utils
 from saleor.checkout.models import Checkout
 from saleor.checkout.utils import add_variant_to_checkout
-from saleor.dashboard.menu.utils import update_menu
 from saleor.discount import DiscountInfo, DiscountValueType, VoucherType
 from saleor.discount.models import Sale, Voucher, VoucherCustomer, VoucherTranslation
 from saleor.giftcard.models import GiftCard
 from saleor.menu.models import Menu, MenuItem
+from saleor.menu.utils import update_menu
 from saleor.order import OrderStatus
 from saleor.order.events import OrderEvents
 from saleor.order.models import FulfillmentStatus, Order, OrderEvent
@@ -32,13 +33,13 @@ from saleor.order.utils import fulfill_order_line, recalculate_order
 from saleor.page.models import Page
 from saleor.payment import ChargeStatus, TransactionKind
 from saleor.payment.models import Payment
+from saleor.product import AttributeInputType
 from saleor.product.models import (
     Attribute,
     AttributeTranslation,
     AttributeValue,
     Category,
     Collection,
-    CollectionProduct,
     DigitalContent,
     DigitalContentUrl,
     Product,
@@ -115,7 +116,7 @@ def checkout_with_voucher(checkout, product, voucher):
     variant = product.variants.get()
     add_variant_to_checkout(checkout, variant, 3)
     checkout.voucher_code = voucher.code
-    checkout.discount_amount = Money("20.00", "USD")
+    checkout.discount = Money("20.00", "USD")
     checkout.save()
     return checkout
 
@@ -125,7 +126,7 @@ def checkout_with_voucher_percentage(checkout, product, voucher_percentage):
     variant = product.variants.get()
     add_variant_to_checkout(checkout, variant, 3)
     checkout.voucher_code = voucher_percentage.code
-    checkout.discount_amount = Money("3.00", "USD")
+    checkout.discount = Money("3.00", "USD")
     checkout.save()
     return checkout
 
@@ -345,6 +346,19 @@ def size_attribute(db):  # pylint: disable=W0613
 
 
 @pytest.fixture
+def attribute_list() -> List[Attribute]:
+    return list(
+        Attribute.objects.bulk_create(
+            [
+                Attribute(slug="size", name="Size"),
+                Attribute(slug="weight", name="Weight"),
+                Attribute(slug="thickness", name="Thickness"),
+            ]
+        )
+    )
+
+
+@pytest.fixture
 def image():
     img_data = BytesIO()
     image = Image.new("RGB", size=(1, 1))
@@ -372,7 +386,7 @@ def categories_tree(db, product_type):  # pylint: disable=W0613
 
     product_attr = product_type.product_attributes.first()
     attr_value = product_attr.values.first()
-    attributes = {smart_text(product_attr.pk): smart_text(attr_value.pk)}
+    attributes = {smart_text(product_attr.pk): [smart_text(attr_value.pk)]}
 
     Product.objects.create(
         name="Test product",
@@ -406,6 +420,11 @@ def permission_manage_orders():
 
 
 @pytest.fixture
+def permission_manage_plugins():
+    return Permission.objects.get(codename="manage_plugins")
+
+
+@pytest.fixture
 def product_type(color_attribute, size_attribute):
     product_type = ProductType.objects.create(
         name="Default Type", has_variants=True, is_shipping_required=True
@@ -427,7 +446,7 @@ def product_type_without_variant():
 def product(product_type, category):
     product_attr = product_type.product_attributes.first()
     attr_value = product_attr.values.first()
-    attributes = {smart_text(product_attr.pk): smart_text(attr_value.pk)}
+    attributes = {smart_text(product_attr.pk): [smart_text(attr_value.pk)]}
 
     product = Product.objects.create(
         name="Test product",
@@ -440,7 +459,7 @@ def product(product_type, category):
     variant_attr = product_type.variant_attributes.first()
     variant_attr_value = variant_attr.values.first()
     variant_attributes = {
-        smart_text(variant_attr.pk): smart_text(variant_attr_value.pk)
+        smart_text(variant_attr.pk): [smart_text(variant_attr_value.pk)]
     }
 
     ProductVariant.objects.create(
@@ -451,6 +470,30 @@ def product(product_type, category):
         quantity=10,
         quantity_allocated=1,
     )
+    return product
+
+
+@pytest.fixture
+def product_with_multiple_values_attributes(product, product_type, category) -> Product:
+
+    attribute = Attribute.objects.create(
+        slug="modes", name="Available Modes", input_type=AttributeInputType.MULTISELECT
+    )
+
+    attr_val_1 = AttributeValue.objects.create(
+        attribute=attribute, name="Eco Mode", slug="eco"
+    )
+    attr_val_2 = AttributeValue.objects.create(
+        attribute=attribute, name="Performance Mode", slug="power"
+    )
+
+    product_type.product_attributes.clear()
+    product_type.product_attributes.add(attribute)
+
+    product.attributes = {
+        smart_text(attribute.pk): [smart_text(attr_val_1.pk), smart_text(attr_val_2.pk)]
+    }
+    product.save(update_fields=["attributes"])
     return product
 
 
@@ -512,7 +555,7 @@ def product_without_shipping(category):
 def product_list(product_type, category):
     product_attr = product_type.product_attributes.first()
     attr_value = product_attr.values.first()
-    attributes = {smart_text(product_attr.pk): smart_text(attr_value.pk)}
+    attributes = {smart_text(product_attr.pk): [smart_text(attr_value.pk)]}
 
     products = Product.objects.bulk_create(
         [
@@ -630,7 +673,7 @@ def unavailable_product_with_variant(product_type, category):
     variant_attr = product_type.variant_attributes.first()
     variant_attr_value = variant_attr.values.first()
     variant_attributes = {
-        smart_text(variant_attr.pk): smart_text(variant_attr_value.pk)
+        smart_text(variant_attr.pk): [smart_text(variant_attr_value.pk)]
     }
 
     ProductVariant.objects.create(
@@ -684,9 +727,9 @@ def voucher_specific_product_type(voucher_percentage):
 
 
 @pytest.fixture
-def voucher_with_high_min_amount_spent():
+def voucher_with_high_min_spent_amount():
     return Voucher.objects.create(
-        code="mirumee", discount_value=10, min_amount_spent=Money(1000000, "USD")
+        code="mirumee", discount_value=10, min_spent=Money(1000000, "USD")
     )
 
 
@@ -723,22 +766,26 @@ def gift_card(customer_user, staff_user):
     return GiftCard.objects.create(
         code="mirumee_giftcard",
         user=customer_user,
-        initial_balance=10,
-        current_balance=10,
+        initial_balance=Money(10, "USD"),
+        current_balance=Money(10, "USD"),
     )
 
 
 @pytest.fixture
 def gift_card_used(staff_user):
     return GiftCard.objects.create(
-        code="gift_card_used", initial_balance=150, current_balance=100
+        code="gift_card_used",
+        initial_balance=Money(150, "USD"),
+        current_balance=Money(100, "USD"),
     )
 
 
 @pytest.fixture
 def gift_card_created_by_staff(staff_user):
     return GiftCard.objects.create(
-        code="mirumee_staff", initial_balance=5, current_balance=5
+        code="mirumee_staff",
+        initial_balance=Money(5, "USD"),
+        current_balance=Money(5, "USD"),
     )
 
 
@@ -916,8 +963,9 @@ def payment_not_authorized(payment_dummy):
 
 
 @pytest.fixture
-def sale(category, collection):
+def sale(product, category, collection):
     sale = Sale.objects.create(name="Sale", value=5)
+    sale.products.add(product)
     sale.categories.add(category)
     sale.collections.add(collection)
     return sale
@@ -1013,10 +1061,7 @@ def collection(db):
 
 @pytest.fixture
 def collection_with_products(db, collection, product_list_published):
-    for sort_order, product in enumerate(product_list_published):
-        CollectionProduct(
-            collection=collection, product=product, sort_order=sort_order
-        ).save()
+    collection.products.set(list(product_list_published))
     return product_list_published
 
 
@@ -1111,7 +1156,9 @@ def menu(db):
 
 @pytest.fixture
 def menu_item(menu):
-    return MenuItem.objects.create(menu=menu, name="Link 1", url="http://example.com/")
+    item = MenuItem.objects.create(menu=menu, name="Link 1", url="http://example.com/")
+    update_menu(menu)
+    return item
 
 
 @pytest.fixture
@@ -1119,6 +1166,7 @@ def menu_item_list(menu):
     menu_item_1 = MenuItem.objects.create(menu=menu, name="Link 1")
     menu_item_2 = MenuItem.objects.create(menu=menu, name="Link 2")
     menu_item_3 = MenuItem.objects.create(menu=menu, name="Link 3")
+    update_menu(menu)
     return menu_item_1, menu_item_2, menu_item_3
 
 
@@ -1192,7 +1240,7 @@ def payment_dummy(db, settings, order_with_lines):
 
 
 @pytest.fixture
-def digital_content(category, media_root):
+def digital_content(category, media_root) -> DigitalContent:
     product_type = ProductType.objects.create(
         name="Digital Type",
         has_variants=True,
@@ -1232,3 +1280,138 @@ def digital_content_url(digital_content, order_line):
 @pytest.fixture
 def media_root(tmpdir, settings):
     settings.MEDIA_ROOT = str(tmpdir.mkdir("media"))
+
+
+@pytest.fixture
+def description_json():
+    return {
+        "blocks": [
+            {
+                "key": "",
+                "data": {},
+                "text": "E-commerce for the PWA era",
+                "type": "header-two",
+                "depth": 0,
+                "entityRanges": [],
+                "inlineStyleRanges": [],
+            },
+            {
+                "key": "",
+                "data": {},
+                "text": (
+                    "A modular, high performance e-commerce storefront "
+                    "built with GraphQL, Django, and ReactJS."
+                ),
+                "type": "unstyled",
+                "depth": 0,
+                "entityRanges": [],
+                "inlineStyleRanges": [],
+            },
+            {
+                "key": "",
+                "data": {},
+                "text": "",
+                "type": "unstyled",
+                "depth": 0,
+                "entityRanges": [],
+                "inlineStyleRanges": [],
+            },
+            {
+                "key": "",
+                "data": {},
+                "text": (
+                    "Saleor is a rapidly-growing open source e-commerce platform "
+                    "that has served high-volume companies from branches "
+                    "like publishing and apparel since 2012. Based on Python "
+                    "and Django, the latest major update introduces a modular "
+                    "front end with a GraphQL API and storefront and dashboard "
+                    "written in React to make Saleor a full-functionality "
+                    "open source e-commerce."
+                ),
+                "type": "unstyled",
+                "depth": 0,
+                "entityRanges": [],
+                "inlineStyleRanges": [],
+            },
+            {
+                "key": "",
+                "data": {},
+                "text": "",
+                "type": "unstyled",
+                "depth": 0,
+                "entityRanges": [],
+                "inlineStyleRanges": [],
+            },
+            {
+                "key": "",
+                "data": {},
+                "text": "Get Saleor today!",
+                "type": "unstyled",
+                "depth": 0,
+                "entityRanges": [{"key": 0, "length": 17, "offset": 0}],
+                "inlineStyleRanges": [],
+            },
+        ],
+        "entityMap": {
+            "0": {
+                "data": {"href": "https://github.com/mirumee/saleor"},
+                "type": "LINK",
+                "mutability": "MUTABLE",
+            }
+        },
+    }
+
+
+@pytest.fixture
+def description_raw():
+    return """\
+E-commerce for the PWA era
+A modular, high performance e-commerce storefront built with GraphQL, Django, \
+and ReactJS.
+
+Saleor is a rapidly-growing open source e-commerce platform that has served \
+high-volume companies from branches like publishing and apparel since 2012. \
+Based on Python and Django, the latest major update introduces a modular \
+front end with a GraphQL API and storefront and dashboard written in React \
+to make Saleor a full-functionality open source e-commerce.
+
+Get Saleor today!"""
+
+
+@pytest.fixture
+def other_description_json():
+    return {
+        "blocks": [
+            {
+                "key": "",
+                "data": {},
+                "text": "A GRAPHQL-FIRST ECOMMERCE PLATFORM FOR PERFECTIONISTS",
+                "type": "header-two",
+                "depth": 0,
+                "entityRanges": [],
+                "inlineStyleRanges": [],
+            },
+            {
+                "key": "",
+                "data": {},
+                "text": (
+                    "Saleor is powered by a GraphQL server running on "
+                    "top of Python 3 and a Django 2 framework."
+                ),
+                "type": "unstyled",
+                "depth": 0,
+                "entityRanges": [],
+                "inlineStyleRanges": [],
+            },
+        ],
+        "entityMap": {},
+    }
+
+
+@pytest.fixture
+def other_description_raw():
+    return (
+        "A GRAPHQL-FIRST ECOMMERCE PLATFORM FOR PERFECTIONISTS\n"
+        "Saleor is powered by a GraphQL server running on top of Python 3 "
+        "and a Django 2 framework."
+    )

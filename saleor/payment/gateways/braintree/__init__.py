@@ -39,7 +39,7 @@ ERROR_CODES_WHITELIST = {
 
 
 def get_customer_data(payment_information: PaymentData) -> Dict:
-    """Provides customer info, use only for new customer creation"""
+    """Provide customer info, use only for new customer creation."""
     billing = payment_information.billing
     return {
         "order_id": payment_information.order_id,
@@ -60,9 +60,7 @@ def get_customer_data(payment_information: PaymentData) -> Dict:
 
 
 def get_error_for_client(errors: List) -> str:
-    """Filters all error messages and decides which one is visible for the
-    client side.
-    """
+    """Filter all error messages and decides which one is visible for the client."""
     if not errors:
         return ""
     default_msg = pgettext_lazy(
@@ -149,6 +147,7 @@ def authorize(
     kind = TransactionKind.CAPTURE if config.auto_capture else TransactionKind.AUTH
     return GatewayResponse(
         is_success=result.is_success,
+        action_required=False,
         kind=kind,
         amount=gateway_response.get("amount", payment_information.amount),
         currency=gateway_response.get("currency", payment_information.currency),
@@ -209,6 +208,7 @@ def capture(payment_information: PaymentData, config: GatewayConfig) -> GatewayR
 
     return GatewayResponse(
         is_success=result.is_success,
+        action_required=False,
         kind=TransactionKind.CAPTURE,
         amount=gateway_response.get("amount", payment_information.amount),
         currency=gateway_response.get("currency", payment_information.currency),
@@ -233,6 +233,7 @@ def void(payment_information: PaymentData, config: GatewayConfig) -> GatewayResp
 
     return GatewayResponse(
         is_success=result.is_success,
+        action_required=False,
         kind=TransactionKind.VOID,
         amount=gateway_response.get("amount", payment_information.amount),
         currency=gateway_response.get("currency", payment_information.currency),
@@ -260,6 +261,7 @@ def refund(payment_information: PaymentData, config: GatewayConfig) -> GatewayRe
 
     return GatewayResponse(
         is_success=result.is_success,
+        action_required=False,
         kind=TransactionKind.REFUND,
         amount=gateway_response.get("amount", payment_information.amount),
         currency=gateway_response.get("currency", payment_information.currency),

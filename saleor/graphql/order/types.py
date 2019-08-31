@@ -5,6 +5,7 @@ from graphene import relay
 
 from ...order import models
 from ...order.models import FulfillmentStatus
+from ...order.utils import get_valid_shipping_methods_for_order
 from ...product.templatetags.product_images import get_product_image_thumbnail
 from ..account.types import User
 from ..core.connection import CountableDjangoObjectType
@@ -15,7 +16,7 @@ from ..payment.types import OrderAction, Payment, PaymentChargeStatusEnum
 from ..product.types import ProductVariant
 from ..shipping.types import ShippingMethod
 from .enums import OrderEventsEmailsEnum, OrderEventsEnum
-from .utils import applicable_shipping_methods, validate_draft_order
+from .utils import validate_draft_order
 
 
 class OrderEventOrderLineObject(graphene.ObjectType):
@@ -182,11 +183,6 @@ class Fulfillment(CountableDjangoObjectType):
 
 
 class OrderLine(CountableDjangoObjectType):
-    thumbnail_url = graphene.String(
-        description="The URL of a main thumbnail for the ordered product.",
-        size=graphene.Int(description="Size of the image"),
-        deprecation_reason="thumbnailUrl is deprecated, use thumbnail instead",
-    )
     thumbnail = graphene.Field(
         Image,
         description="The main thumbnail for the ordered product.",
@@ -218,20 +214,6 @@ class OrderLine(CountableDjangoObjectType):
             "tax_rate",
             "translated_product_name",
         ]
-
-    @staticmethod
-    @gql_optimizer.resolver_hints(
-        prefetch_related=["variant__images", "variant__product__images"]
-    )
-    def resolve_thumbnail_url(root: models.OrderLine, info, size=None):
-        if not root.variant_id:
-            return None
-        if not size:
-            size = 255
-        url = get_product_image_thumbnail(
-            root.variant.get_first_image(), size, method="thumbnail"
-        )
-        return info.context.build_absolute_uri(url)
 
     @staticmethod
     @gql_optimizer.resolver_hints(
@@ -325,6 +307,13 @@ class Order(CountableDjangoObjectType):
     is_shipping_required = graphene.Boolean(
         description="Returns True, if order requires shipping.", required=True
     )
+    discount_amount = graphene.Field(
+        Money,
+        deprecation_reason=(
+            "DEPRECATED: Will be removed in Saleor 2.10, use discount instead."
+        ),
+        required=True,
+    )
 
     class Meta:
         description = "Represents an order in the shop."
@@ -334,7 +323,7 @@ class Order(CountableDjangoObjectType):
             "billing_address",
             "created",
             "customer_note",
-            "discount_amount",
+            "discount",
             "discount_name",
             "display_gross_prices",
             "gift_cards",
@@ -455,7 +444,10 @@ class Order(CountableDjangoObjectType):
 
     @staticmethod
     def resolve_available_shipping_methods(root: models.Order, _info):
-        return applicable_shipping_methods(root, root.get_subtotal().gross.amount)
+        available = get_valid_shipping_methods_for_order(root)
+        if available is None:
+            return []
+        return available
 
     @staticmethod
     def resolve_is_shipping_required(root: models.Order, _info):
@@ -464,3 +456,7 @@ class Order(CountableDjangoObjectType):
     @staticmethod
     def resolve_gift_cards(root: models.Order, _info):
         return root.gift_cards.all()
+
+    @staticmethod
+    def resolve_discount_amount(root: models.Order, _info):
+        return root.discount

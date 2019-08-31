@@ -324,6 +324,39 @@ def test_payment_refund_error(
     assert not txn.is_success
 
 
+CONFIRM_QUERY = """
+    mutation PaymentConfirm($paymentId: ID!) {
+        paymentSecureConfirm(paymentId: $paymentId) {
+            payment {
+                id,
+                chargeStatus
+            }
+            errors {
+                field
+                message
+            }
+        }
+    }
+"""
+
+
+def test_payment_confirmation_success(
+    user_api_client, payment_txn_preauth, graphql_address_data
+):
+    payment_id = graphene.Node.to_global_id("Payment", payment_txn_preauth.pk)
+    variables = {"paymentId": payment_id}
+    response = user_api_client.post_graphql(CONFIRM_QUERY, variables)
+    content = get_graphql_content(response)
+    data = content["data"]["paymentSecureConfirm"]
+    assert not data["errors"]
+
+    payment_txn_preauth.refresh_from_db()
+    assert payment_txn_preauth.charge_status == ChargeStatus.FULLY_CHARGED
+    assert payment_txn_preauth.transactions.count() == 2
+    txn = payment_txn_preauth.transactions.last()
+    assert txn.kind == TransactionKind.CAPTURE
+
+
 def test_payments_query(
     payment_txn_captured, permission_manage_orders, staff_api_client
 ):
@@ -468,7 +501,11 @@ def braintree_customer_id():
 
 def test_store_payment_gateway_meta(customer_user, braintree_customer_id):
     gateway_name = PaymentGatewayEnum.BRAINTREE.name
-    META = {"gateways": {gateway_name.upper(): {"customer_id": braintree_customer_id}}}
+    META = {
+        "payment-gateways": {
+            gateway_name.upper(): {"customer_id": braintree_customer_id}
+        }
+    }
     store_customer_id(customer_user, gateway_name, braintree_customer_id)
     assert customer_user.private_meta == META
     customer_user.refresh_from_db()

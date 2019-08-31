@@ -3,10 +3,11 @@ from collections import defaultdict
 from typing import Iterable
 
 from django.db.models import F
+from django.utils import timezone
 from django.utils.translation import pgettext
 
 from ..core.taxes import zero_money
-from ..core.taxes.interface import calculate_checkout_subtotal
+from ..extensions.manager import get_extensions_manager
 from . import DiscountInfo
 from .models import NotApplicable, Sale, VoucherCustomer
 
@@ -85,7 +86,8 @@ def calculate_discounted_price(product, price, discounts: Iterable[DiscountInfo]
 
 
 def validate_voucher_for_checkout(voucher, checkout, discounts):
-    subtotal = calculate_checkout_subtotal(checkout, discounts)
+    manager = get_extensions_manager()
+    subtotal = manager.calculate_checkout_subtotal(checkout, discounts)
     customer_email = checkout.get_customer_email()
     validate_voucher(voucher, subtotal.gross, checkout.quantity, customer_email)
 
@@ -98,7 +100,7 @@ def validate_voucher_in_order(order):
 
 
 def validate_voucher(voucher, total_price, quantity, customer_email):
-    voucher.validate_min_amount_spent(total_price)
+    voucher.validate_min_spent(total_price)
     voucher.validate_min_checkout_items_quantity(quantity)
     if voucher.apply_once_per_customer:
         voucher.validate_once_per_customer(customer_email)
@@ -109,7 +111,7 @@ def get_products_voucher_discount(voucher, prices):
     if voucher.apply_once_per_order:
         return voucher.get_discount_amount_for(min(prices))
     discounts = (voucher.get_discount_amount_for(price) for price in prices)
-    total_amount = sum(discounts, zero_money())
+    total_amount = sum(discounts, zero_money(voucher.currency))
     return total_amount
 
 
@@ -168,3 +170,7 @@ def fetch_discounts(date: datetime.date):
         )
         for sale in sales
     ]
+
+
+def fetch_active_discounts():
+    return fetch_discounts(timezone.now())

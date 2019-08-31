@@ -11,10 +11,11 @@ from django.utils.text import slugify
 from graphql_relay import to_global_id
 from prices import Money
 
-from saleor.core.taxes import TaxType, interface as tax_interface
+from saleor.core.taxes import TaxType
+from saleor.extensions.manager import ExtensionsManager
 from saleor.graphql.core.enums import ReportingPeriod
 from saleor.graphql.product.enums import StockAvailability
-from saleor.graphql.product.types.products import resolve_attribute_list
+from saleor.product import AttributeInputType
 from saleor.product.models import (
     Attribute,
     AttributeValue,
@@ -64,22 +65,6 @@ def query_collections_with_filter():
         }
         """
     return query
-
-
-def test_resolve_attribute_list(color_attribute):
-    value = color_attribute.values.first()
-    attributes_hstore = {str(color_attribute.pk): str(value.pk)}
-    res = resolve_attribute_list(attributes_hstore, Attribute.objects.all())
-    assert len(res) == 1
-    assert res[0].attribute.name == color_attribute.name
-    assert res[0].value.name == value.name
-
-    # test passing invalid hstore should resolve to empty list
-    attr_pk = str(Attribute.objects.order_by("pk").last().pk + 1)
-    val_pk = str(AttributeValue.objects.order_by("pk").last().pk + 1)
-    attributes_hstore = {attr_pk: val_pk}
-    res = resolve_attribute_list(attributes_hstore, Attribute.objects.all())
-    assert res == []
 
 
 def test_fetch_all_products(user_api_client, product):
@@ -134,7 +119,7 @@ def test_product_query(staff_api_client, product, permission_manage_products):
                         id
                         name
                         url
-                        thumbnailUrl
+                        slug
                         thumbnail{
                             url
                             alt
@@ -194,6 +179,7 @@ def test_product_query(staff_api_client, product, permission_manage_products):
     product_data = product_edges_data[0]["node"]
     assert product_data["name"] == product.name
     assert product_data["url"] == product.get_absolute_url()
+    assert product_data["slug"] == product.get_slug()
     gross = product_data["pricing"]["priceRange"]["start"]["gross"]
     assert float(gross["amount"]) == float(product.price.amount)
     from saleor.product.utils.costs import get_product_costs_data
@@ -244,16 +230,15 @@ def test_products_query_with_filter_attributes(
     product_type = ProductType.objects.create(
         name="Custom Type", has_variants=True, is_shipping_required=True
     )
-    attribute = Attribute.objects.create(
-        slug="new_attr", name="Attr", product_type=product_type
-    )
+    attribute = Attribute.objects.create(slug="new_attr", name="Attr")
+    attribute.product_types.add(product_type)
     attr_value = AttributeValue.objects.create(
         attribute=attribute, name="First", slug="first"
     )
     second_product = product
     second_product.id = None
     second_product.product_type = product_type
-    second_product.attributes = {smart_text(attribute.pk): smart_text(attr_value.pk)}
+    second_product.attributes = {smart_text(attribute.pk): [smart_text(attr_value.pk)]}
     second_product.save()
 
     variables = {
@@ -344,25 +329,35 @@ def test_products_query_with_filter_collection(
 
 
 @pytest.mark.parametrize(
-    "filter",
-    ({"price": {"gte": 5.0, "lte": 9.0}}, {"isPublished": False}, {"search": "Juice1"}),
+    "products_filter",
+    [
+        {"price": {"gte": 5.0, "lte": 9.0}},
+        {"minimalPrice": {"gte": 1.0, "lte": 2.0}},
+        {"isPublished": False},
+        {"search": "Juice1"},
+    ],
 )
 def test_products_query_with_filter(
-    filter,
+    products_filter,
     query_products_with_filter,
     staff_api_client,
     product,
     permission_manage_products,
 ):
+    assert product.price == Money("10.00", "USD")
+    assert product.minimal_variant_price == Money("10.00", "USD")
+    assert product.is_published is True
+    assert "Juice1" not in product.name
 
     second_product = product
     second_product.id = None
     second_product.name = "Apple Juice1"
     second_product.price = Money("6.00", "USD")
-    second_product.is_published = filter.get("isPublished", True)
+    second_product.minimal_variant_price = Money("1.99", "USD")
+    second_product.is_published = products_filter.get("isPublished", True)
     second_product.save()
 
-    variables = {"filter": filter}
+    variables = {"filter": products_filter}
     staff_api_client.user.user_permissions.add(permission_manage_products)
     response = staff_api_client.post_graphql(query_products_with_filter, variables)
     content = get_graphql_content(response)
@@ -599,12 +594,14 @@ def test_filter_products_by_collections(user_api_client, collection, product):
 def test_sort_products(user_api_client, product):
     # set price and update date of the first product
     product.price = Money("10.00", "USD")
+    product.minimal_variant_price = Money("10.00", "USD")
     product.updated_at = datetime.utcnow()
     product.save()
 
     # Create the second product with higher price and date
     product.pk = None
     product.price = Money("20.00", "USD")
+    product.minimal_variant_price = Money("20.00", "USD")
     product.updated_at = datetime.utcnow()
     product.save()
 
@@ -621,6 +618,13 @@ def test_sort_products(user_api_client, product):
                                 }
                             }
                         }
+                        priceRange {
+                            start {
+                                gross {
+                                    amount
+                                }
+                            }
+                        }
                     }
                     updatedAt
                 }
@@ -629,32 +633,65 @@ def test_sort_products(user_api_client, product):
     }
     """
 
-    def _get_node_price(data, node):
-        return data["data"]["products"]["edges"][node]["node"]["pricing"][
-            "priceRangeUndiscounted"
-        ]["start"]["gross"]["amount"]
-
+    # Test sorting by PRICE, ascending
     asc_price_query = query % {"sort_by_product_order": "{field: PRICE, direction:ASC}"}
     response = user_api_client.post_graphql(asc_price_query)
     content = get_graphql_content(response)
+    edges = content["data"]["products"]["edges"]
+    price1 = edges[0]["node"]["pricing"]["priceRangeUndiscounted"]["start"]["gross"][
+        "amount"
+    ]
+    price2 = edges[1]["node"]["pricing"]["priceRangeUndiscounted"]["start"]["gross"][
+        "amount"
+    ]
+    assert price1 < price2
 
-    assert _get_node_price(content, 0) < _get_node_price(content, 1)
-
+    # Test sorting by PRICE, descending
     desc_price_query = query % {
         "sort_by_product_order": "{field: PRICE, direction:DESC}"
     }
     response = user_api_client.post_graphql(desc_price_query)
     content = get_graphql_content(response)
-    assert _get_node_price(content, 0) > _get_node_price(content, 1)
+    edges = content["data"]["products"]["edges"]
+    price1 = edges[0]["node"]["pricing"]["priceRangeUndiscounted"]["start"]["gross"][
+        "amount"
+    ]
+    price2 = edges[1]["node"]["pricing"]["priceRangeUndiscounted"]["start"]["gross"][
+        "amount"
+    ]
+    assert price1 > price2
 
+    # Test sorting by MINIMAL_PRICE, ascending
+    asc_price_query = query % {
+        "sort_by_product_order": "{field: MINIMAL_PRICE, direction:ASC}"
+    }
+    response = user_api_client.post_graphql(asc_price_query)
+    content = get_graphql_content(response)
+    edges = content["data"]["products"]["edges"]
+    price1 = edges[0]["node"]["pricing"]["priceRange"]["start"]["gross"]["amount"]
+    price2 = edges[1]["node"]["pricing"]["priceRange"]["start"]["gross"]["amount"]
+    assert price1 < price2
+
+    # Test sorting by MINIMAL_PRICE, descending
+    desc_price_query = query % {
+        "sort_by_product_order": "{field: MINIMAL_PRICE, direction:DESC}"
+    }
+    response = user_api_client.post_graphql(desc_price_query)
+    content = get_graphql_content(response)
+    edges = content["data"]["products"]["edges"]
+    price1 = edges[0]["node"]["pricing"]["priceRange"]["start"]["gross"]["amount"]
+    price2 = edges[1]["node"]["pricing"]["priceRange"]["start"]["gross"]["amount"]
+    assert price1 > price2
+
+    # Test sorting by DATE, ascending
     asc_date_query = query % {"sort_by_product_order": "{field: DATE, direction:ASC}"}
     response = user_api_client.post_graphql(asc_date_query)
     content = get_graphql_content(response)
-    # parse_datetime
     date_0 = content["data"]["products"]["edges"][0]["node"]["updatedAt"]
     date_1 = content["data"]["products"]["edges"][1]["node"]["updatedAt"]
     assert parse_datetime(date_0) < parse_datetime(date_1)
 
+    # Test sorting by DATE, descending
     desc_date_query = query % {"sort_by_product_order": "{field: DATE, direction:DESC}"}
     response = user_api_client.post_graphql(desc_date_query)
     content = get_graphql_content(response)
@@ -668,7 +705,10 @@ def test_create_product(
     product_type,
     category,
     size_attribute,
+    description_json,
+    description_raw,
     permission_manage_products,
+    settings,
     monkeypatch,
 ):
     query = """
@@ -676,7 +716,6 @@ def test_create_product(
             $productTypeId: ID!,
             $categoryId: ID!,
             $name: String!,
-            $description: String!,
             $descriptionJson: JSONString!,
             $isPublished: Boolean!,
             $chargeTaxes: Boolean!,
@@ -688,7 +727,6 @@ def test_create_product(
                         category: $categoryId,
                         productType: $productTypeId,
                         name: $name,
-                        description: $description,
                         descriptionJson: $descriptionJson,
                         isPublished: $isPublished,
                         chargeTaxes: $chargeTaxes,
@@ -700,7 +738,6 @@ def test_create_product(
                             category {
                                 name
                             }
-                            description
                             descriptionJson
                             isPublished
                             chargeTaxes
@@ -719,7 +756,7 @@ def test_create_product(
                                 attribute {
                                     slug
                                 }
-                                value {
+                                values {
                                     slug
                                 }
                             }
@@ -732,30 +769,33 @@ def test_create_product(
                       }
     """
 
+    settings.USE_JSON_CONTENT = True
+
+    description_json = json.dumps(description_json)
+
     product_type_id = graphene.Node.to_global_id("ProductType", product_type.pk)
     category_id = graphene.Node.to_global_id("Category", category.pk)
-    product_description = "test description"
-    product_description_json = json.dumps({"content": "description"})
     product_name = "test name"
     product_is_published = True
     product_charge_taxes = True
     product_tax_rate = "STANDARD"
-    product_price = 22.33
+    product_price = "22.33"
 
     # Mock tax interface with fake response from tax gateway
     monkeypatch.setattr(
-        "saleor.graphql.product.types.products.tax_interface.get_tax_from_object_meta",
-        lambda x: TaxType(description="", code=product_tax_rate),
+        ExtensionsManager,
+        "get_tax_code_from_object_meta",
+        lambda self, x: TaxType(description="", code=product_tax_rate),
     )
 
     # Default attribute defined in product_type fixture
     color_attr = product_type.product_attributes.get(name="Color")
     color_value_slug = color_attr.values.first().slug
-    color_attr_slug = color_attr.slug
+    color_attr_id = graphene.Node.to_global_id("Attribute", color_attr.id)
 
     # Add second attribute
     product_type.product_attributes.add(size_attribute)
-    size_attr_slug = product_type.product_attributes.get(name="Size").slug
+    size_attr_id = graphene.Node.to_global_id("Attribute", size_attribute.id)
     non_existent_attr_value = "The cake is a lie"
 
     # test creating root product
@@ -763,15 +803,14 @@ def test_create_product(
         "productTypeId": product_type_id,
         "categoryId": category_id,
         "name": product_name,
-        "description": product_description,
-        "descriptionJson": product_description_json,
+        "descriptionJson": description_json,
         "isPublished": product_is_published,
         "chargeTaxes": product_charge_taxes,
         "taxCode": product_tax_rate,
         "basePrice": product_price,
         "attributes": [
-            {"slug": color_attr_slug, "value": color_value_slug},
-            {"slug": size_attr_slug, "value": non_existent_attr_value},
+            {"id": color_attr_id, "values": [color_value_slug]},
+            {"id": size_attr_id, "values": [non_existent_attr_value]},
         ],
     }
 
@@ -782,16 +821,16 @@ def test_create_product(
     data = content["data"]["productCreate"]
     assert data["errors"] == []
     assert data["product"]["name"] == product_name
-    assert data["product"]["description"] == product_description
-    assert data["product"]["descriptionJson"] == product_description_json
+    assert data["product"]["descriptionJson"] == description_json
     assert data["product"]["isPublished"] == product_is_published
     assert data["product"]["chargeTaxes"] == product_charge_taxes
     assert data["product"]["taxType"]["taxCode"] == product_tax_rate
     assert data["product"]["productType"]["name"] == product_type.name
     assert data["product"]["category"]["name"] == category.name
+    assert str(data["product"]["basePrice"]["amount"]) == product_price
     values = (
-        data["product"]["attributes"][0]["value"]["slug"],
-        data["product"]["attributes"][1]["value"]["slug"],
+        data["product"]["attributes"][0]["values"][0]["slug"],
+        data["product"]["attributes"][1]["values"][0]["slug"],
     )
     assert slugify(non_existent_attr_value) in values
     assert color_value_slug in values
@@ -802,7 +841,6 @@ QUERY_CREATE_PRODUCT_WITHOUT_VARIANTS = """
         $productTypeId: ID!,
         $categoryId: ID!
         $name: String!,
-        $description: String!,
         $basePrice: Decimal!,
         $sku: String,
         $quantity: Int,
@@ -813,7 +851,6 @@ QUERY_CREATE_PRODUCT_WITHOUT_VARIANTS = """
                 category: $categoryId,
                 productType: $productTypeId,
                 name: $name,
-                description: $description,
                 basePrice: $basePrice,
                 sku: $sku,
                 quantity: $quantity,
@@ -854,7 +891,6 @@ def test_create_product_without_variants(
     product_type_id = graphene.Node.to_global_id("ProductType", product_type.pk)
     category_id = graphene.Node.to_global_id("Category", category.pk)
     product_name = "test name"
-    product_description = "description"
     product_price = 10
     sku = "sku"
     quantity = 1
@@ -864,7 +900,6 @@ def test_create_product_without_variants(
         "productTypeId": product_type_id,
         "categoryId": category_id,
         "name": product_name,
-        "description": product_description,
         "basePrice": product_price,
         "sku": sku,
         "quantity": quantity,
@@ -894,7 +929,6 @@ def test_create_product_without_variants_sku_validation(
     product_type_id = graphene.Node.to_global_id("ProductType", product_type.pk)
     category_id = graphene.Node.to_global_id("Category", category.pk)
     product_name = "test name"
-    product_description = "description"
     product_price = 10
     quantity = 1
     track_inventory = True
@@ -903,7 +937,6 @@ def test_create_product_without_variants_sku_validation(
         "productTypeId": product_type_id,
         "categoryId": category_id,
         "name": product_name,
-        "description": product_description,
         "basePrice": product_price,
         "sku": None,
         "quantity": quantity,
@@ -932,7 +965,6 @@ def test_create_product_without_variants_sku_duplication(
     product_type_id = graphene.Node.to_global_id("ProductType", product_type.pk)
     category_id = graphene.Node.to_global_id("Category", category.pk)
     product_name = "test name"
-    product_description = "description"
     product_price = 10
     quantity = 1
     track_inventory = True
@@ -942,7 +974,6 @@ def test_create_product_without_variants_sku_duplication(
         "productTypeId": product_type_id,
         "categoryId": category_id,
         "name": product_name,
-        "description": product_description,
         "basePrice": product_price,
         "sku": sku,
         "quantity": quantity,
@@ -994,15 +1025,19 @@ def test_update_product(
     category,
     non_default_category,
     product,
+    other_description_json,
+    other_description_raw,
     permission_manage_products,
+    settings,
     monkeypatch,
+    color_attribute,
 ):
     query = """
         mutation updateProduct(
             $productId: ID!,
             $categoryId: ID!,
             $name: String!,
-            $description: String!,
+            $descriptionJson: JSONString!,
             $isPublished: Boolean!,
             $chargeTaxes: Boolean!,
             $taxCode: String!,
@@ -1013,7 +1048,7 @@ def test_update_product(
                     input: {
                         category: $categoryId,
                         name: $name,
-                        description: $description,
+                        descriptionJson: $descriptionJson,
                         isPublished: $isPublished,
                         chargeTaxes: $chargeTaxes,
                         taxCode: $taxCode,
@@ -1024,7 +1059,7 @@ def test_update_product(
                             category {
                                 name
                             }
-                            description
+                            descriptionJson
                             isPublished
                             chargeTaxes
                             taxType {
@@ -1040,10 +1075,12 @@ def test_update_product(
                             }
                             attributes {
                                 attribute {
+                                    id
                                     name
                                 }
-                                value {
+                                values {
                                     name
+                                    slug
                                 }
                             }
                           }
@@ -1054,30 +1091,39 @@ def test_update_product(
                         }
                       }
     """
+
+    settings.USE_JSON_CONTENT = True
+
+    other_description_json = json.dumps(other_description_json)
+
     product_id = graphene.Node.to_global_id("Product", product.pk)
     category_id = graphene.Node.to_global_id("Category", non_default_category.pk)
-    product_description = "updated description"
     product_name = "updated name"
     product_is_published = True
     product_charge_taxes = True
     product_tax_rate = "STANDARD"
     product_price = "33.12"
+    assert str(product.price.amount) == "10.00"
 
     # Mock tax interface with fake response from tax gateway
     monkeypatch.setattr(
-        "saleor.graphql.product.types.products.tax_interface.get_tax_from_object_meta",
-        lambda x: TaxType(description="", code=product_tax_rate),
+        ExtensionsManager,
+        "get_tax_code_from_object_meta",
+        lambda self, x: TaxType(description="", code=product_tax_rate),
     )
+
+    attribute_id = graphene.Node.to_global_id("Attribute", color_attribute.pk)
 
     variables = {
         "productId": product_id,
         "categoryId": category_id,
         "name": product_name,
-        "description": product_description,
+        "descriptionJson": other_description_json,
         "isPublished": product_is_published,
         "chargeTaxes": product_charge_taxes,
         "taxCode": product_tax_rate,
         "basePrice": product_price,
+        "attributes": [{"id": attribute_id, "values": ["Rainbow"]}],
     }
 
     response = staff_api_client.post_graphql(
@@ -1087,11 +1133,73 @@ def test_update_product(
     data = content["data"]["productUpdate"]
     assert data["errors"] == []
     assert data["product"]["name"] == product_name
-    assert data["product"]["description"] == product_description
+    assert data["product"]["descriptionJson"] == other_description_json
     assert data["product"]["isPublished"] == product_is_published
     assert data["product"]["chargeTaxes"] == product_charge_taxes
     assert data["product"]["taxType"]["taxCode"] == product_tax_rate
+    assert str(data["product"]["basePrice"]["amount"]) == product_price
     assert not data["product"]["category"]["name"] == category.name
+
+    attributes = data["product"]["attributes"]
+
+    assert len(attributes) == 1
+    assert len(attributes[0]["values"]) == 1
+
+    assert attributes[0]["attribute"]["id"] == attribute_id
+    assert attributes[0]["values"][0]["name"] == "Rainbow"
+    assert attributes[0]["values"][0]["slug"] == "rainbow"
+
+
+SET_ATTRIBUTES_TO_PRODUCT_QUERY = """
+    mutation updateProduct($productId: ID!, $attributes: [AttributeValueInput!]) {
+      productUpdate(id: $productId, input: { attributes: $attributes }) {
+        errors {
+          message
+          field
+        }
+      }
+    }
+"""
+
+
+def test_update_product_can_only_assign_multiple_values_to_valid_input_types(
+    staff_api_client, product, permission_manage_products, color_attribute
+):
+    """Ensures you cannot assign multiple values to input types
+    that are not multi-select. This also ensures multi-select types
+    can be assigned multiple values as intended."""
+
+    staff_api_client.user.user_permissions.add(permission_manage_products)
+
+    multi_values_attr = Attribute.objects.create(
+        name="multi", slug="multi-vals", input_type=AttributeInputType.MULTISELECT
+    )
+    multi_values_attr.product_types.add(product.product_type)
+    multi_values_attr_id = graphene.Node.to_global_id("Attribute", multi_values_attr.id)
+
+    color_attribute_id = graphene.Node.to_global_id("Attribute", color_attribute.id)
+
+    # Try to assign multiple values from an attribute that does not support such things
+    variables = {
+        "productId": graphene.Node.to_global_id("Product", product.pk),
+        "attributes": [{"id": color_attribute_id, "values": ["red", "blue"]}],
+    }
+    data = get_graphql_content(
+        staff_api_client.post_graphql(SET_ATTRIBUTES_TO_PRODUCT_QUERY, variables)
+    )["data"]["productUpdate"]
+    assert data["errors"] == [
+        {
+            "field": "attributes",
+            "message": "A dropdown attribute must take only one value",
+        }
+    ]
+
+    # Try to assign multiple values from a valid attribute
+    variables["attributes"] = [{"id": multi_values_attr_id, "values": ["a", "b"]}]
+    data = get_graphql_content(
+        staff_api_client.post_graphql(SET_ATTRIBUTES_TO_PRODUCT_QUERY, variables)
+    )["data"]["productUpdate"]
+    assert not data["errors"]
 
 
 def test_update_product_without_variants(
@@ -1102,8 +1210,7 @@ def test_update_product_without_variants(
         $productId: ID!,
         $sku: String,
         $quantity: Int,
-        $trackInventory: Boolean,
-        $description: String)
+        $trackInventory: Boolean)
     {
         productUpdate(
             id: $productId,
@@ -1111,7 +1218,6 @@ def test_update_product_without_variants(
                 sku: $sku,
                 quantity: $quantity,
                 trackInventory: $trackInventory,
-                description: $description
             })
         {
             product {
@@ -1136,14 +1242,12 @@ def test_update_product_without_variants(
     product_sku = "test_sku"
     product_quantity = 10
     product_track_inventory = False
-    product_description = "test description"
 
     variables = {
         "productId": product_id,
         "sku": product_sku,
         "quantity": product_quantity,
         "trackInventory": product_track_inventory,
-        "description": product_description,
     }
 
     response = staff_api_client.post_graphql(
@@ -1262,14 +1366,9 @@ def test_product_type_query(
     monkeypatch,
 ):
     monkeypatch.setattr(
-        "saleor.graphql.product.types.products."
-        "vatlayer_interface.get_tax_from_object_meta",
-        lambda x: TaxType(code="standard", description=""),
-    )
-    monkeypatch.setattr(
-        "saleor.graphql.product.types.products."
-        "tax_interface.get_tax_from_object_meta",
-        lambda x: TaxType(code="123", description="Standard Taxes"),
+        ExtensionsManager,
+        "get_tax_code_from_object_meta",
+        lambda self, x: TaxType(code="123", description="Standard Taxes"),
     )
     query = """
             query getProductType($id: ID!) {
@@ -1306,7 +1405,6 @@ def test_product_type_query(
     content = get_graphql_content(response)
     data = content["data"]
     assert data["productType"]["products"]["totalCount"] == no_products
-    assert data["productType"]["taxRate"] == "STANDARD"
     assert data["productType"]["taxType"]["taxCode"] == "123"
     assert data["productType"]["taxType"]["description"] == "Standard Taxes"
 
@@ -1315,11 +1413,8 @@ def test_product_type_create_mutation(
     staff_api_client, product_type, permission_manage_products, monkeypatch, settings
 ):
     settings.VATLAYER_ACCESS_KEY = "test"
-    monkeypatch.setattr(
-        "saleor.graphql.product.types.products."
-        "vatlayer_interface.get_tax_from_object_meta",
-        lambda x: TaxType(code="standard", description=""),
-    )
+    settings.PLUGINS = ["saleor.extensions.plugins.vatlayer.plugin.VatlayerPlugin"]
+    manager = ExtensionsManager(plugins=settings.PLUGINS)
     query = """
     mutation createProductType(
         $name: String!,
@@ -1372,7 +1467,7 @@ def test_product_type_create_mutation(
     variables = {
         "name": product_type_name,
         "hasVariants": has_variants,
-        "taxCode": "STANDARD",
+        "taxCode": "wine",
         "isShippingRequired": require_shipping,
         "productAttributes": product_attributes_ids,
         "variantAttributes": variant_attributes_ids,
@@ -1403,8 +1498,8 @@ def test_product_type_create_mutation(
     )
 
     new_instance = ProductType.objects.latest("pk")
-    tax_code = tax_interface.get_tax_from_object_meta(new_instance).code
-    assert tax_code == "standard"
+    tax_code = manager.get_tax_code_from_object_meta(new_instance).code
+    assert tax_code == "wine"
 
 
 def test_product_type_update_mutation(
@@ -1897,11 +1992,9 @@ def test_product_variant_price(
     product.price = Money(amount=product_price, currency="USD")
     product.save()
     if variant_override is not None:
-        product.variants.update(
-            price_override=Money(amount=variant_override, currency="USD")
-        )
+        product.variants.update(price_override_amount=variant_override, currency="USD")
     else:
-        product.variants.update(price_override=None)
+        product.variants.update(price_override_amount=None)
     # Drop other variants
     # product.variants.exclude(id=variant.pk).delete()
 
@@ -1998,13 +2091,13 @@ def test_report_product_sales(
     line_a = order_with_lines.lines.get(product_sku=node_a["sku"])
     assert node_a["quantityOrdered"] == line_a.quantity
     amount = str(node_a["revenue"]["gross"]["amount"])
-    assert Decimal(amount) == line_a.quantity * line_a.unit_price_gross.amount
+    assert Decimal(amount) == line_a.quantity * line_a.unit_price_gross_amount
 
     node_b = edges[1]["node"]
     line_b = order_with_lines.lines.get(product_sku=node_b["sku"])
     assert node_b["quantityOrdered"] == line_b.quantity
     amount = str(node_b["revenue"]["gross"]["amount"])
-    assert Decimal(amount) == line_b.quantity * line_b.unit_price_gross.amount
+    assert Decimal(amount) == line_b.quantity * line_b.unit_price_gross_amount
 
 
 def test_variant_revenue_permissions(
@@ -2311,3 +2404,147 @@ def test_product_base_price_permission(
 
     assert "basePrice" in content["data"]["product"]
     assert content["data"]["product"]["basePrice"]["amount"] == product.price.amount
+
+
+QUERY_AVAILABLE_ATTRIBUTES = """
+    query($productTypeId:ID!, $filters: AttributeFilterInput) {
+      productType(id: $productTypeId) {
+        availableAttributes(first: 10, filter: $filters) {
+          edges {
+            node {
+              id
+              slug
+            }
+          }
+        }
+      }
+    }
+"""
+
+
+def test_product_type_get_unassigned_attributes(
+    staff_api_client, permission_manage_products
+):
+    query = QUERY_AVAILABLE_ATTRIBUTES
+    target_product_type, ignored_product_type = ProductType.objects.bulk_create(
+        [ProductType(name="Type 1"), ProductType(name="Type 2")]
+    )
+
+    unassigned_attributes = list(
+        Attribute.objects.bulk_create(
+            [
+                Attribute(slug="size", name="Size"),
+                Attribute(slug="weight", name="Weight"),
+                Attribute(slug="thickness", name="Thickness"),
+            ]
+        )
+    )
+
+    assigned_attributes = list(
+        Attribute.objects.bulk_create(
+            [Attribute(slug="color", name="Color"), Attribute(slug="type", name="Type")]
+        )
+    )
+
+    # Ensure that assigning them to another product type
+    # doesn't return an invalid response
+    ignored_product_type.product_attributes.add(*unassigned_attributes)
+
+    # Assign the other attributes to the target product type
+    target_product_type.product_attributes.add(*assigned_attributes)
+
+    gql_unassigned_attributes = get_graphql_content(
+        staff_api_client.post_graphql(
+            query,
+            {
+                "productTypeId": graphene.Node.to_global_id(
+                    "ProductType", target_product_type.pk
+                )
+            },
+            permissions=[permission_manage_products],
+        )
+    )["data"]["productType"]["availableAttributes"]["edges"]
+
+    assert len(gql_unassigned_attributes) == len(
+        unassigned_attributes
+    ), gql_unassigned_attributes
+
+    received_ids = sorted((attr["node"]["id"] for attr in gql_unassigned_attributes))
+    expected_ids = sorted(
+        (
+            graphene.Node.to_global_id("Attribute", attr.pk)
+            for attr in unassigned_attributes
+        )
+    )
+
+    assert received_ids == expected_ids
+
+
+def test_product_type_filter_unassigned_attributes(
+    staff_api_client, permission_manage_products, attribute_list
+):
+    expected_attribute = attribute_list[0]
+    query = QUERY_AVAILABLE_ATTRIBUTES
+    product_type = ProductType.objects.create(name="Empty Type")
+    product_type_id = graphene.Node.to_global_id("ProductType", product_type.pk)
+    filters = {"search": expected_attribute.name}
+
+    found_attributes = get_graphql_content(
+        staff_api_client.post_graphql(
+            query,
+            {"productTypeId": product_type_id, "filters": filters},
+            permissions=[permission_manage_products],
+        )
+    )["data"]["productType"]["availableAttributes"]["edges"]
+
+    assert len(found_attributes) == 1
+
+    _, attribute_id = graphene.Node.from_global_id(found_attributes[0]["node"]["id"])
+    assert attribute_id == str(expected_attribute.pk)
+
+
+QUERY_FILTER_PRODUCT_TYPES = """
+    query($filters: ProductTypeFilterInput) {
+      productTypes(first: 10, filter: $filters) {
+        edges {
+          node {
+            name
+          }
+        }
+      }
+    }
+"""
+
+
+@pytest.mark.parametrize(
+    "search, expected_names",
+    (
+        ("", ["The best juices", "The best beers", "The worst beers"]),
+        ("best", ["The best juices", "The best beers"]),
+        ("worst", ["The worst beers"]),
+        ("average", []),
+    ),
+)
+def test_filter_product_types_by_custom_search_value(
+    api_client, search, expected_names
+):
+    query = QUERY_FILTER_PRODUCT_TYPES
+
+    ProductType.objects.bulk_create(
+        [
+            ProductType(name="The best juices"),
+            ProductType(name="The best beers"),
+            ProductType(name="The worst beers"),
+        ]
+    )
+
+    variables = {"filters": {"search": search}}
+
+    results = get_graphql_content(api_client.post_graphql(query, variables))["data"][
+        "productTypes"
+    ]["edges"]
+
+    assert len(results) == len(expected_names)
+    matched_names = sorted([result["node"]["name"] for result in results])
+
+    assert matched_names == sorted(expected_names)

@@ -13,6 +13,7 @@ from django.http import (
 from django.shortcuts import get_object_or_404, redirect
 from django.template.response import TemplateResponse
 from django.urls import reverse
+from draftjs_sanitizer import SafeJSONEncoder
 
 from ..checkout.utils import set_checkout_cookie
 from ..core.utils import serialize_decimal
@@ -80,16 +81,23 @@ def product_details(request, slug, product_id, form=None):
         discounts=request.discounts,
         country=request.country,
         local_currency=request.currency,
+        extensions=request.extensions,
     )
     product_images = get_product_images(product)
     variant_picker_data = get_variant_picker_data(
-        product, request.discounts, request.taxes, request.currency, request.country
+        product,
+        request.discounts,
+        request.extensions,
+        request.currency,
+        request.country,
     )
     product_attributes = get_product_attributes_data(product)
     # show_variant_picker determines if variant picker is used or select input
     show_variant_picker = all([v.attributes for v in product.variants.all()])
     json_ld_data = product_json_ld(product, product_attributes)
     ctx = {
+        "description_json": product.translated.description_json,
+        "description_html": product.translated.description,
         "is_visible": is_visible,
         "form": form,
         "availability": availability,
@@ -98,15 +106,17 @@ def product_details(request, slug, product_id, form=None):
         "product_images": product_images,
         "show_variant_picker": show_variant_picker,
         "variant_picker_data": json.dumps(
-            variant_picker_data, default=serialize_decimal
+            variant_picker_data, default=serialize_decimal, cls=SafeJSONEncoder
         ),
-        "json_ld_product_data": json.dumps(json_ld_data, default=serialize_decimal),
+        "json_ld_product_data": json.dumps(
+            json_ld_data, default=serialize_decimal, cls=SafeJSONEncoder
+        ),
     }
     return TemplateResponse(request, "product/details.html", ctx)
 
 
 def digital_product(request, token: str) -> Union[FileResponse, HttpResponseNotFound]:
-    """Returns direct download link to content if given token is still valid"""
+    """Return the direct download link to content if given token is still valid."""
 
     qs = DigitalContentUrl.objects.prefetch_related("line__order__user")
     content_url = get_object_or_404(qs, token=token)  # type: DigitalContentUrl

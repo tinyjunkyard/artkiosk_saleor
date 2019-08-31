@@ -1,17 +1,18 @@
 import bleach
 from django import forms
 from django.conf import settings
-from django.db.models import Count, Q
+from django.db.models import Count
 from django.forms.models import ModelChoiceIterator
 from django.forms.widgets import CheckboxSelectMultiple
 from django.utils.encoding import smart_text
 from django.utils.text import slugify
 from django.utils.translation import pgettext_lazy
+from django_prices.forms import MoneyField
 from mptt.forms import TreeNodeChoiceField
 
-from ...core.taxes import include_taxes_in_prices
-from ...core.taxes.interface import get_tax_from_object_meta, get_tax_rate_type_choices
+from ...core.taxes import include_taxes_in_prices, zero_money
 from ...core.weight import WeightField
+from ...extensions.manager import get_extensions_manager
 from ...product.models import (
     Attribute,
     AttributeValue,
@@ -23,15 +24,32 @@ from ...product.models import (
     ProductVariant,
     VariantImage,
 )
-from ...product.tasks import update_variants_names
+from ...product.tasks import (
+    update_product_minimal_variant_price_task,
+    update_variants_names,
+)
 from ...product.thumbnails import create_product_thumbnails
 from ...product.utils.attributes import get_name_from_attributes
-from ..forms import ModelChoiceOrCreationField, OrderedModelMultipleChoiceField
+from ..forms import (
+    ModelChoiceOrCreationField,
+    MoneyModelForm,
+    OrderedModelMultipleChoiceField,
+)
 from ..seo.fields import SeoDescriptionField, SeoTitleField
 from ..seo.utils import prepare_seo_description
 from ..widgets import RichTextEditorWidget
 from . import ProductBulkAction
 from .widgets import ImagePreviewWidget
+
+
+def make_money_field():
+    return MoneyField(
+        available_currencies=settings.AVAILABLE_CURRENCIES,
+        min_values=[zero_money()],
+        max_digits=settings.DEFAULT_MAX_DIGITS,
+        decimal_places=settings.DEFAULT_DECIMAL_PLACES,
+        required=False,
+    )
 
 
 class RichTextField(forms.CharField):
@@ -106,26 +124,20 @@ class ProductTypeForm(forms.ModelForm):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        manager = get_extensions_manager()
         self.fields["tax_rate"].choices = [
-            (tax.code, tax.description) for tax in get_tax_rate_type_choices()
+            (tax.code, tax.description) for tax in manager.get_tax_rate_type_choices()
         ]
-        unassigned_attrs_q = Q(
-            product_type__isnull=True, product_variant_type__isnull=True
-        )
+        variant_attrs_qs = product_attrs_qs = Attribute.objects.all()
 
         if self.instance.pk:
-            product_attrs_qs = Attribute.objects.filter(
-                Q(product_type=self.instance) | unassigned_attrs_q
+            product_attrs_initial = (
+                self.instance.product_attributes.all().product_attributes_sorted()
             )
-            variant_attrs_qs = Attribute.objects.filter(
-                Q(product_variant_type=self.instance) | unassigned_attrs_q
+            variant_attrs_initial = (
+                self.instance.variant_attributes.all().variant_attributes_sorted()
             )
-            product_attrs_initial = self.instance.product_attributes.all()
-            variant_attrs_initial = self.instance.variant_attributes.all()
         else:
-            unassigned_attrs = Attribute.objects.filter(unassigned_attrs_q)
-            product_attrs_qs = unassigned_attrs
-            variant_attrs_qs = unassigned_attrs
             product_attrs_initial = []
             variant_attrs_initial = []
 
@@ -228,15 +240,14 @@ class AttributesMixin:
                         attribute_id=attr.pk, name=value, slug=slugify(value)
                     )
                     value.save()
-                attributes[smart_text(attr.pk)] = smart_text(value.pk)
+                attributes[smart_text(attr.pk)] = [smart_text(value.pk)]
         return attributes
 
 
-class ProductForm(forms.ModelForm, AttributesMixin):
+class ProductForm(MoneyModelForm, AttributesMixin):
     tax_rate = forms.ChoiceField(
         required=False, label=pgettext_lazy("Product tax rate type", "Tax rate")
     )
-
     category = TreeNodeChoiceField(
         queryset=Category.objects.all(), label=pgettext_lazy("Category", "Category")
     )
@@ -257,15 +268,23 @@ class ProductForm(forms.ModelForm, AttributesMixin):
             "if empty, equal to default value used on the ProductType.",
         ),
     )
+    price = make_money_field()
 
     model_attributes_field = "attributes"
 
     class Meta:
         model = Product
-        exclude = ["attributes", "product_type", "updated_at", "description_json"]
+        exclude = [
+            "attributes",
+            "product_type",
+            "updated_at",
+            "description_json",
+            "price_amount",
+            "currency",
+            "minimal_variant_price_amount",
+        ]
         labels = {
             "name": pgettext_lazy("Item name", "Name"),
-            "price": pgettext_lazy("Currency amount", "Price"),
             "publication_date": pgettext_lazy(
                 "Availability date", "Publish product on"
             ),
@@ -277,14 +296,15 @@ class ProductForm(forms.ModelForm, AttributesMixin):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        manager = get_extensions_manager()
         product_type = self.instance.product_type
-        product_tax_rate = get_tax_from_object_meta(self.instance).code
+        product_tax_rate = manager.get_tax_code_from_object_meta(self.instance).code
         self.initial["tax_rate"] = (
-            product_tax_rate or get_tax_from_object_meta(product_type).code
+            product_tax_rate or manager.get_tax_code_from_object_meta(product_type).code
         )
         self.available_attributes = product_type.product_attributes.prefetch_related(
             "values"
-        ).all()
+        ).product_attributes_sorted()
         self.prepare_fields_for_attributes()
         self.fields["collections"].initial = Collection.objects.filter(
             products__name=self.instance
@@ -299,7 +319,7 @@ class ProductForm(forms.ModelForm, AttributesMixin):
             extra_attrs={"data-bind": self["name"].auto_id}
         )
         self.fields["tax_rate"].choices = [
-            (tax.code, tax.description) for tax in get_tax_rate_type_choices()
+            (tax.code, tax.description) for tax in manager.get_tax_rate_type_choices()
         ]
         if include_taxes_in_prices():
             self.fields["price"].label = pgettext_lazy(
@@ -317,6 +337,8 @@ class ProductForm(forms.ModelForm, AttributesMixin):
                 "placeholder"
             ] = product_type.weight.value
 
+        self.fields["price"].required = True
+
     def clean_seo_description(self):
         seo_description = prepare_seo_description(
             seo_description=self.cleaned_data["seo_description"],
@@ -328,14 +350,17 @@ class ProductForm(forms.ModelForm, AttributesMixin):
     def save(self, commit=True):
         attributes = self.get_saved_attributes()
         self.instance.attributes = attributes
+
         instance = super().save()
         instance.collections.clear()
+
         for collection in self.cleaned_data["collections"]:
             instance.collections.add(collection)
+        update_product_minimal_variant_price_task.delay(instance.pk)
         return instance
 
 
-class ProductVariantForm(forms.ModelForm, AttributesMixin):
+class ProductVariantForm(MoneyModelForm, AttributesMixin):
     model_attributes_field = "attributes"
     weight = WeightField(
         required=False,
@@ -346,6 +371,8 @@ class ProductVariantForm(forms.ModelForm, AttributesMixin):
             "If empty, weight from Product or ProductType will be used.",
         ),
     )
+    price_override = make_money_field()
+    cost_price = make_money_field()
 
     class Meta:
         model = ProductVariant
@@ -359,9 +386,7 @@ class ProductVariantForm(forms.ModelForm, AttributesMixin):
         ]
         labels = {
             "sku": pgettext_lazy("SKU", "SKU"),
-            "price_override": pgettext_lazy("Override price", "Selling price override"),
             "quantity": pgettext_lazy("Integer number", "Number in stock"),
-            "cost_price": pgettext_lazy("Currency amount", "Cost price"),
             "track_inventory": pgettext_lazy(
                 "Track inventory field", "Track inventory"
             ),
@@ -380,8 +405,10 @@ class ProductVariantForm(forms.ModelForm, AttributesMixin):
             self.fields["price_override"].widget.attrs[
                 "placeholder"
             ] = self.instance.product.price.amount
-            qs = self.instance.product.product_type.variant_attributes.all()
-            self.available_attributes = qs.prefetch_related("values")
+            qs = self.instance.product.product_type.variant_attributes
+            self.available_attributes = qs.prefetch_related(
+                "values"
+            ).variant_attributes_sorted()
             self.prepare_fields_for_attributes()
 
         if include_taxes_in_prices():
@@ -408,13 +435,20 @@ class ProductVariantForm(forms.ModelForm, AttributesMixin):
             )
 
     def save(self, commit=True):
+        assert commit is True, "Commit is required"
+
         attributes = self.get_saved_attributes()
         self.instance.attributes = attributes
         attrs = self.instance.product.product_type.variant_attributes.prefetch_related(
             "values__translations"
         )
         self.instance.name = get_name_from_attributes(self.instance, attrs)
-        return super().save(commit=commit)
+
+        super().save(commit=commit)
+
+        # Note: save must always be called with commit=True
+        update_product_minimal_variant_price_task.delay(self.instance.product_id)
+        return self.instance
 
 
 class CachingModelChoiceIterator(ModelChoiceIterator):
@@ -493,7 +527,7 @@ class VariantImagesSelectForm(forms.Form):
 class AttributeForm(forms.ModelForm):
     class Meta:
         model = Attribute
-        exclude = []
+        exclude = ["input_type"]
         labels = {
             "name": pgettext_lazy("Product display name", "Display name"),
             "slug": pgettext_lazy("Product internal name", "Internal name"),

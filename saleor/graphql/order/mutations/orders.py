@@ -2,9 +2,13 @@ import graphene
 from django.core.exceptions import ValidationError
 
 from ....account.models import User
-from ....core.taxes import interface as tax_interface, zero_taxed_money
+from ....core.taxes import zero_taxed_money
 from ....order import events, models
-from ....order.utils import cancel_order, recalculate_order
+from ....order.utils import (
+    cancel_order,
+    get_valid_shipping_methods_for_order,
+    recalculate_order,
+)
 from ....payment import CustomPaymentChoices, PaymentError
 from ....payment.utils import (
     clean_mark_order_as_paid,
@@ -13,7 +17,6 @@ from ....payment.utils import (
     gateway_void,
     mark_order_as_paid,
 )
-from ....shipping.models import ShippingMethod as ShippingMethodModel
 from ...account.types import AddressInput
 from ...core.mutations import BaseMutation
 from ...core.scalars import Decimal
@@ -31,13 +34,10 @@ def clean_order_update_shipping(order, method):
             }
         )
 
-    valid_methods = ShippingMethodModel.objects.applicable_shipping_methods(
-        price=order.get_subtotal().gross.amount,
-        weight=order.get_total_weight(),
-        country_code=order.shipping_address.country.code,
-    )
-    valid_methods = valid_methods.values_list("id", flat=True)
-    if method.pk not in valid_methods:
+    valid_methods = get_valid_shipping_methods_for_order(order)
+    if valid_methods is None or method.pk not in valid_methods.values_list(
+        "id", flat=True
+    ):
         raise ValidationError(
             {"shipping_method": "Shipping method cannot be used with this order."}
         )
@@ -154,9 +154,10 @@ class OrderUpdateShipping(BaseMutation):
             order.shipping_method_name = None
             order.save(
                 update_fields=[
+                    "currency",
                     "shipping_method",
-                    "shipping_price_net",
-                    "shipping_price_gross",
+                    "shipping_price_net_amount",
+                    "shipping_price_gross_amount",
                     "shipping_method_name",
                 ]
             )
@@ -172,14 +173,15 @@ class OrderUpdateShipping(BaseMutation):
         clean_order_update_shipping(order, method)
 
         order.shipping_method = method
-        order.shipping_price = tax_interface.calculate_order_shipping(order)
+        order.shipping_price = info.context.extensions.calculate_order_shipping(order)
         order.shipping_method_name = method.name
         order.save(
             update_fields=[
+                "currency",
                 "shipping_method",
                 "shipping_method_name",
-                "shipping_price_net",
-                "shipping_price_gross",
+                "shipping_price_net_amount",
+                "shipping_price_gross_amount",
             ]
         )
         # Post-process the results

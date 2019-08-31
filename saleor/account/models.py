@@ -1,5 +1,3 @@
-import uuid
-
 from django.conf import settings
 from django.contrib.auth.models import (
     AbstractBaseUser,
@@ -16,6 +14,7 @@ from django_countries.fields import Country, CountryField
 from phonenumber_field.modelfields import PhoneNumber, PhoneNumberField
 from versatileimagefield.fields import VersatileImageField
 
+from ..core.models import ModelWithMetadata
 from ..core.utils.json_serializer import CustomJsonEncoder
 from . import CustomerEvents
 from .validators import validate_possible_number
@@ -127,11 +126,7 @@ class UserManager(BaseUserManager):
         return self.get_queryset().filter(is_staff=True)
 
 
-def get_token():
-    return str(uuid.uuid4())
-
-
-class User(PermissionsMixin, AbstractBaseUser):
+class User(PermissionsMixin, ModelWithMetadata, AbstractBaseUser):
     email = models.EmailField(unique=True)
     first_name = models.CharField(max_length=256, blank=True)
     last_name = models.CharField(max_length=256, blank=True)
@@ -139,7 +134,6 @@ class User(PermissionsMixin, AbstractBaseUser):
         Address, blank=True, related_name="user_addresses"
     )
     is_staff = models.BooleanField(default=False)
-    token = models.UUIDField(default=get_token, editable=False, unique=True)
     is_active = models.BooleanField(default=True)
     note = models.TextField(null=True, blank=True)
     date_joined = models.DateTimeField(default=timezone.now, editable=False)
@@ -150,8 +144,6 @@ class User(PermissionsMixin, AbstractBaseUser):
         Address, related_name="+", null=True, blank=True, on_delete=models.SET_NULL
     )
     avatar = VersatileImageField(upload_to="user-avatars", blank=True, null=True)
-
-    private_meta = JSONField(blank=True, default=dict, encoder=CustomJsonEncoder)
 
     USERNAME_FIELD = "email"
 
@@ -188,14 +180,6 @@ class User(PermissionsMixin, AbstractBaseUser):
         if address:
             return "%s %s (%s)" % (address.first_name, address.last_name, self.email)
         return self.email
-
-    def get_private_meta(self, label):
-        return self.private_meta.get(label, {})
-
-    def store_private_meta(self, label, key, value):
-        if label not in self.private_meta:
-            self.private_meta[label] = {}
-        self.private_meta[label][str(key)] = value
 
 
 class CustomerNote(models.Model):
